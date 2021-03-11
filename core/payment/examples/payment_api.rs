@@ -95,7 +95,7 @@ pub async fn start_gnt_driver(
     fake_list_identities(vec![requestor]);
     fake_subscribe_to_events();
 
-    gnt::PaymentDriverService::gsb(db).await?;
+    erc20::PaymentDriverService::gsb(db).await?;
 
     let requestor_sign_tx = get_sign_tx(requestor_account);
     fake_sign_tx(Box::new(requestor_sign_tx));
@@ -220,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Driver::Erc20 => {
             start_gnt_driver(&db, requestor_account).await?;
-            gnt::DRIVER_NAME
+            erc20::DRIVER_NAME
         }
         Driver::Zksync => {
             start_zksync_driver(&db, requestor_account).await?;
