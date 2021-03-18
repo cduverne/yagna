@@ -34,6 +34,7 @@ use crate::{
     zksync::wallet,
     DEFAULT_NETWORK, DRIVER_NAME,
 };
+use std::cell::RefCell;
 
 lazy_static! {
     static ref TX_SUMBIT_TIMEOUT: Duration = Duration::minutes(15);
@@ -353,6 +354,15 @@ Mind that to be eligible you have to run your app at least once on testnet -
             allocation_surcharge,
         );
         Ok(msg.amount <= (account_balance - total_allocated_amount - allocation_surcharge))
+    }
+
+    async fn shut_down(
+        &self,
+        _db: DbExecutor,
+        _caller: String,
+        _msg: ShutDown,
+    ) -> Result<(), GenericError> {
+        unimplemented!() // TODO
     }
 }
 

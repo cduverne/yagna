@@ -10,11 +10,13 @@ use std::{
     env,
     fmt::Debug,
     path::{Path, PathBuf},
+    time::Duration,
 };
 use structopt::{clap, StructOpt};
 use url::Url;
 
 use ya_activity::service::Activity as ActivityService;
+use ya_core_model::payment::local as pay_local;
 use ya_file_logging::start_logger;
 use ya_identity::service::Identity as IdentityService;
 use ya_market::MarketService;
@@ -29,6 +31,7 @@ use ya_service_api_web::{
     middleware::{auth, Identity},
     rest_api_host_port, DEFAULT_YAGNA_API_URL, YAGNA_API_URL_ENV_VAR,
 };
+use ya_service_bus::typed as bus;
 use ya_sgx::SgxService;
 use ya_utils_path::data_dir::DataDir;
 use ya_utils_process::lock::ProcLock;
@@ -39,6 +42,7 @@ use autocomplete::CompleteCommand;
 
 lazy_static::lazy_static! {
     static ref DEFAULT_DATA_DIR: String = DataDir::new(clap::crate_name!()).to_string();
+    static ref PAYMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 }
 
 #[derive(StructOpt, Debug)]
@@ -408,6 +412,18 @@ impl ServiceCommand {
                 future::try_join(server.run(), sd_notify(false, "READY=1")).await?;
 
                 log::info!("{} service successfully finished!", app_name);
+
+                log::info!("Stopping payment service...");
+                future::select(
+                    tokio::time::timeout(
+                        *PAYMENT_SHUTDOWN_TIMEOUT,
+                        bus::service(pay_local::BUS_ID)
+                            .call(pay_local::ShutDown::new(*PAYMENT_SHUTDOWN_TIMEOUT)),
+                    ),
+                    actix_rt::signal::ctrl_c().boxed(),
+                )
+                .await;
+                log::info!("Payment service stopped.");
                 logger_handle.shutdown();
                 Ok(CommandOutput::NoOutput)
             }

@@ -8256,6 +8256,7 @@ dependencies = [
  "url",
  "ya-activity",
  "ya-compile-time-utils",
+ "ya-core-model",
  "ya-dummy-driver",
  "ya-file-logging",
  "ya-gnt-driver",

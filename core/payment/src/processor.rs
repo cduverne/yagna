@@ -10,11 +10,13 @@ use futures::FutureExt;
 use metrics::counter;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::time::Duration;
 use ya_client_model::payment::driver_details::DriverDetails;
 use ya_client_model::payment::network::Network;
 use ya_client_model::payment::{Account, ActivityPayment, AgreementPayment, Payment};
 use ya_core_model::driver::{
-    self, driver_bus_id, AccountMode, PaymentConfirmation, PaymentDetails, ValidateAllocation,
+    self, driver_bus_id, AccountMode, PaymentConfirmation, PaymentDetails, ShutDown,
+    ValidateAllocation,
 };
 use ya_core_model::payment::local::{
     NotifyPayment, RegisterAccount, RegisterAccountError, RegisterDriver, RegisterDriverError,
@@ -266,6 +268,10 @@ impl DriverRegistry {
         }
 
         Err(AccountNotRegistered::new(platform, address, mode))
+    }
+
+    pub fn iter_drivers(&self) -> impl Iterator<Item = &String> {
+        self.drivers.keys()
     }
 }
 
@@ -584,5 +590,29 @@ impl PaymentProcessor {
         };
         let result = driver_endpoint(&driver).send(msg).await??;
         Ok(result)
+    }
+
+    pub async fn shut_down(&self, timeout: Duration) {
+        let driver_shutdown_futures = self
+            .registry
+            .iter_drivers()
+            .map(|driver| shut_down_driver(driver, timeout));
+        futures::future::join_all(driver_shutdown_futures).await;
+    }
+}
+
+fn shut_down_driver(
+    driver: &str,
+    timeout: Duration,
+) -> impl futures::Future<Output = ()> + 'static {
+    let driver = driver.to_string();
+    let endpoint = driver_endpoint(&driver);
+    let shutdown_msg = ShutDown::new(timeout);
+    async move {
+        log::info!("Shutting down driver '{}'... timeout={:?}", driver, timeout);
+        match endpoint.call(shutdown_msg).await {
+            Ok(Ok(_)) => log::info!("Driver '{}' shut down successfully.", driver),
+            err => log::error!("Error shutting down driver '{}': {:?}", driver, err),
+        }
     }
 }
