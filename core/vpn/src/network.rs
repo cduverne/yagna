@@ -13,7 +13,7 @@ use smoltcp::socket::{
 };
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{IpAddress, IpCidr, IpEndpoint};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::TryFrom;
 use std::net::IpAddr;
 use std::ops::{DerefMut, RangeInclusive};
@@ -100,23 +100,33 @@ impl Handler<VpnCreateNetwork> for VpnSupervisor {
     type Result = <VpnCreateNetwork as Message>::Result;
 
     fn handle(&mut self, msg: VpnCreateNetwork, _: &mut Self::Context) -> Self::Result {
-        if self.networks.contains_key(&msg.net_id) {
-            return Err(Error::NetIdTaken(msg.net_id));
+        if self.networks.contains_key(&msg.network.id) {
+            return Err(Error::NetIdTaken(msg.network.id));
         }
+        let net = to_net(
+            &msg.network.address,
+            &msg.network.mask.unwrap_or_else(|| "255.255.255.0".into()),
+        )?;
 
-        let (net_id, ip_net) =
-            to_net(&msg.net_ip, &msg.net_mask).map(|n| (msg.net_id.clone(), n))?;
-        let (net_ip, route) = net_route(&ip_net)?;
-        let address = net_address(&msg.node_ip, &ip_net)?;
+        let net_ip = IpCidr::new(net.addr().into(), net.prefix_len());
+        let node_ip = node_addr(&msg.requestor_address, &net)?;
+        let route = net_route(&net)?;
 
-        let network = Network::new(&net_id, ip_net);
-        let mut local_stack = default_iface();
-        add_iface_address(&mut local_stack, address);
-        add_iface_route(&mut local_stack, net_ip, route);
+        let mut stack = default_iface();
+        add_iface_address(&mut stack, node_ip);
+        add_iface_route(&mut stack, net_ip, route);
 
-        let vpn = Vpn::new(network, local_stack).start();
-        self.networks.insert(net_id, vpn);
+        let node = (node_ip.address().to_string(), msg.requestor_id.clone());
+        let net = Network::new(&msg.network.id, net);
 
+        let vpn = Vpn::new(msg.activity_id, msg.requestor_id, net, stack).start();
+        vpn.do_send(VpnAddNode {
+            net_id: msg.network.id.clone(),
+            id: node.1,
+            address: node.0,
+        });
+
+        self.networks.insert(msg.network.id, vpn);
         Ok(())
     }
 }
@@ -177,6 +187,8 @@ impl Handler<VpnRemoveNode> for VpnSupervisor {
 }
 
 pub struct Vpn {
+    activity_id: String,
+    requestor_id: String,
     vpn: Network<Endpoint>,
     stack: CaptureInterface<'static>,
     sockets: SocketSet<'static>,
@@ -185,8 +197,15 @@ pub struct Vpn {
 }
 
 impl Vpn {
-    pub fn new(vpn: Network<Endpoint>, stack: CaptureInterface<'static>) -> Self {
+    pub fn new(
+        activity_id: String,
+        requestor_id: String,
+        vpn: Network<Endpoint>,
+        stack: CaptureInterface<'static>,
+    ) -> Self {
         Self {
+            activity_id,
+            requestor_id,
             vpn,
             stack,
             sockets: SocketSet::new(vec![]),
@@ -195,9 +214,12 @@ impl Vpn {
         }
     }
 
-    fn process(&mut self, to_receive: Option<Vec<u8>>, mut to_send: Option<Packet>) {
-        let mut to_remove = HashSet::new();
-
+    fn process(
+        &mut self,
+        to_receive: Option<Vec<u8>>,
+        mut to_send: Option<Packet>,
+        addr: Addr<Self>,
+    ) {
         if let Some(frame) = to_receive {
             self.stack.device_mut().phy_tx(frame);
         }
@@ -207,12 +229,8 @@ impl Vpn {
                 log::warn!("VPN {}: socket poll error: {}", self.vpn.id(), err);
             }
 
-            let processed_ingress = self.process_ingress(&mut to_remove);
+            let processed_ingress = self.process_ingress(addr.clone());
             let processed_egress = self.process_egress(&mut to_send);
-
-            to_remove.drain().for_each(|h| {
-                self.remove_connection(h);
-            });
 
             if !processed_ingress && !processed_egress {
                 break;
@@ -220,9 +238,8 @@ impl Vpn {
         }
     }
 
-    fn process_ingress(&mut self, to_remove: &mut HashSet<SocketHandle>) -> bool {
+    fn process_ingress(&mut self, actor: Addr<Self>) -> bool {
         let mut processed = false;
-        let vpn_id = self.vpn.id().clone();
 
         let sockets = &mut self.sockets;
         let connections = &self.connections;
@@ -230,7 +247,10 @@ impl Vpn {
         for mut socket_ref in sockets.iter_mut() {
             let socket: &mut Socket = socket_ref.deref_mut();
             if !socket.is_open() {
-                to_remove.insert(socket_ref.handle());
+                actor.do_send(Disconnect {
+                    handle: socket_ref.handle(),
+                    reason: DisconnectReason::SocketClosed,
+                });
                 continue;
             }
 
@@ -239,7 +259,7 @@ impl Vpn {
                     Ok(Some(tup)) => tup,
                     Ok(None) => break,
                     Err(err) => {
-                        log::error!("VPN {}: packet error: {}", vpn_id, err);
+                        log::error!("VPN {}: packet error: {}", self.vpn.id(), err);
                         continue;
                     }
                 };
@@ -250,21 +270,21 @@ impl Vpn {
                 let mut sender = match conn {
                     Some((sender, _)) => sender.clone(),
                     None => {
-                        log::warn!("VPN {}: no connection to {}:{}", vpn_id, addr, port);
+                        log::warn!("VPN {}: no connection to {}:{}", self.vpn.id(), addr, port);
                         continue;
                     }
                 };
 
-                let vpn_id_ = vpn_id.clone();
+                let addr_ = actor.clone();
+                let handle_ = socket.handle();
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = sender.send(data).await {
-                        log::warn!(
-                            "VPN {}: connection {}:{} error: {}",
-                            vpn_id_,
-                            addr,
-                            port,
-                            err
-                        )
+                    if let Err(_) = sender.send(data).await {
+                        let _ = addr_
+                            .send(Disconnect {
+                                handle: handle_,
+                                reason: DisconnectReason::SinkClosed,
+                            })
+                            .await;
                     }
                 });
             }
@@ -389,17 +409,6 @@ impl Vpn {
         processed
     }
 
-    fn remove_connection(&mut self, handle: SocketHandle) -> Option<mpsc::Sender<Vec<u8>>> {
-        let socket = self.sockets.remove(handle);
-        socket
-            .tuple()
-            .map(|t| {
-                self.ports.free(t.0, t.2);
-                self.connections.remove(&t).map(|c| c.0)
-            })
-            .flatten()
-    }
-
     fn log_send_err<E: ToString>(&self, ip: IpAddress, port: u16, msg: E) {
         log::warn!(
             "VPN {}: unable to send packet to {}:{}: {}",
@@ -415,14 +424,14 @@ impl Actor for Vpn {
     type Context = Context<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
-        let vpn_id = gsb_network_url(self.vpn.id());
+        let vpn_id = gsb_url(self.vpn.id());
         actix_rpc::bind::<VpnPacket>(&vpn_id, ctx.address().recipient());
         log::info!("VPN {} started", self.vpn.id());
     }
 
     fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
         let id = self.vpn.id().clone();
-        let vpn_id = gsb_network_url(&id);
+        let vpn_id = gsb_url(&id);
 
         async move {
             log::debug!("Stopping VPN {}", id);
@@ -446,7 +455,7 @@ impl Handler<VpnAddAddress> for Vpn {
         if &msg.net_id != self.vpn.id() {
             return Err(Error::Other("Invalid network ID".to_string()));
         }
-        self.vpn.add_address(&msg.ip)
+        self.vpn.add_address(&msg.address)
     }
 }
 
@@ -458,19 +467,21 @@ impl Handler<VpnAddNode> for Vpn {
             return Err(Error::Other("Invalid network ID".to_string()));
         }
 
-        let ip = to_ip(&msg.ip)?;
-        self.vpn.add_node(ip, &msg.id, gsb_endpoint)?;
+        let ip = to_ip(&msg.address)?;
+        self.vpn.add_node(ip, &msg.id, gsb_net_endpoint)?;
 
         let vpn_id = self.vpn.id().clone();
         let futs = self
             .vpn
-            .endpoints()
-            .values()
-            .cloned()
+            .nodes()
+            .keys()
+            .map(|id| gsb_activity_endpoint(&self.requestor_id, id, &self.activity_id))
             .map(|e| {
                 e.send(VpnControl::AddNodes {
                     network_id: vpn_id.clone(),
-                    nodes: vec![(msg.ip.clone(), msg.id.clone())].into_iter().collect(),
+                    nodes: vec![(msg.address.clone(), msg.id.clone())]
+                        .into_iter()
+                        .collect(),
                 })
             })
             .collect::<Vec<_>>();
@@ -496,9 +507,9 @@ impl Handler<VpnRemoveNode> for Vpn {
         let vpn_id = self.vpn.id().clone();
         let futs = self
             .vpn
-            .endpoints()
-            .values()
-            .cloned()
+            .nodes()
+            .keys()
+            .map(|id| gsb_activity_endpoint(&self.requestor_id, id, &self.activity_id))
             .map(|e| {
                 e.send(VpnControl::RemoveNodes {
                     network_id: vpn_id.clone(),
@@ -522,7 +533,7 @@ impl Handler<ConnectTcp> for Vpn {
         let protocol = Protocol::Tcp;
         let local_ip: IpAddress = self.vpn.address()?.into();
         let local_port = self.ports.next(protocol)?;
-        let remote_ip: IpAddress = to_ip(&msg.ip)?.into();
+        let remote_ip: IpAddress = to_ip(&msg.address)?.into();
         let remote_port = msg.port;
 
         let tcp_socket = {
@@ -566,10 +577,23 @@ impl Handler<ConnectTcp> for Vpn {
     }
 }
 
+impl Handler<Disconnect> for Vpn {
+    type Result = <Disconnect as Message>::Result;
+
+    fn handle(&mut self, msg: Disconnect, _: &mut Self::Context) -> Self::Result {
+        self.sockets.remove(msg.handle).tuple().map(|t| {
+            log::debug!("Disconnecting {:?}: {:?}", t, msg.reason);
+            self.ports.free(t.0, t.2);
+            self.connections.remove(&t).map(|c| c.0)
+        });
+        Ok(())
+    }
+}
+
 /// Handle egress packet from the user
 impl StreamHandler<Packet> for Vpn {
-    fn handle(&mut self, pkt: Packet, _: &mut Self::Context) {
-        self.process(None, Some(pkt));
+    fn handle(&mut self, pkt: Packet, ctx: &mut Self::Context) {
+        self.process(None, Some(pkt), ctx.address());
     }
 }
 
@@ -577,8 +601,8 @@ impl StreamHandler<Packet> for Vpn {
 impl Handler<RpcEnvelope<VpnPacket>> for Vpn {
     type Result = <RpcEnvelope<VpnPacket> as Message>::Result;
 
-    fn handle(&mut self, msg: RpcEnvelope<VpnPacket>, _: &mut Self::Context) -> Self::Result {
-        self.process(Some(msg.into_inner().0), None);
+    fn handle(&mut self, msg: RpcEnvelope<VpnPacket>, ctx: &mut Self::Context) -> Self::Result {
+        self.process(Some(msg.into_inner().0), None, ctx.address());
         Ok(())
     }
 }
@@ -747,36 +771,39 @@ fn icmp_socket_tuple(_: &IcmpSocket) -> SocketTuple {
     )
 }
 
-fn net_address(ip: &str, net: &IpNet) -> Result<IpCidr> {
+fn node_addr(ip: &str, ip_net: &IpNet) -> Result<IpCidr> {
     let ip = to_ip(ip.as_ref())?;
-    if !net.contains(&ip) {
+    if !ip_net.contains(&ip) {
         return Err(Error::NetAddrMismatch(ip));
     }
 
-    let cidr = IpCidr::new(ip.clone().into(), net.prefix_len());
+    let cidr = IpCidr::new(ip.clone().into(), ip_net.prefix_len());
     if !cidr.address().is_unicast() && !cidr.address().is_unspecified() {
         return Err(Error::IpAddrNotAllowed(ip));
     }
+
     Ok(cidr)
 }
 
-fn net_route(ip_net: &IpNet) -> Result<(IpCidr, Route)> {
+fn net_route(ip_net: &IpNet) -> Result<Route> {
     let ip = ip_net
         .hosts()
         .next()
         .ok_or_else(|| Error::NetCidr(ip_net.addr(), ip_net.prefix_len()))?;
-    let cidr = IpCidr::new(ip_net.addr().into(), ip_net.prefix_len());
-    let route = match ip {
+    Ok(match ip {
         IpAddr::V4(a) => Route::new_ipv4_gateway(a.into()),
         IpAddr::V6(a) => Route::new_ipv6_gateway(a.into()),
-    };
-    Ok((cidr, route))
+    })
 }
 
-fn gsb_network_url(network_id: &str) -> String {
+fn gsb_url(network_id: &str) -> String {
     format!("/public/vpn/{}", network_id)
 }
 
-fn gsb_endpoint(node_id: &str, net_id: &str) -> Endpoint {
+fn gsb_net_endpoint(node_id: &str, net_id: &str) -> Endpoint {
     typed::service(format!("/net/{}/vpn/{}", node_id, net_id))
+}
+
+fn gsb_activity_endpoint(from: &str, to: &str, activity_id: &str) -> Endpoint {
+    typed::service(format!("/from/{}/to/{}/exeunit/{}", from, to, activity_id))
 }

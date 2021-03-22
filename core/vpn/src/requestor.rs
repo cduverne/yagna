@@ -7,7 +7,7 @@ use futures::channel::mpsc;
 use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
-use ya_client_model::vpn::{AddNode, CreateNetwork};
+use ya_client_model::net::*;
 use ya_client_model::ErrorMessage;
 use ya_service_api_web::middleware::Identity;
 
@@ -31,11 +31,12 @@ pub fn web_scope() -> actix_web::Scope {
 #[actix_web::post("/net")]
 async fn create_network(
     create_network: web::Json<CreateNetwork>,
-    _identity: Identity,
+    identity: Identity,
 ) -> Result<impl Responder> {
+    let requestor_id = identity.identity.to_string();
     let create_network = create_network.into_inner();
     VpnSupervisor::from_registry()
-        .send(VpnCreateNetwork::from(create_network))
+        .send(VpnCreateNetwork::new(requestor_id, create_network))
         .await??;
     Ok(web::Json(()))
 }
@@ -58,14 +59,14 @@ async fn remove_network(
 #[actix_web::post("/net/{net_id}/nodes")]
 async fn add_node(
     path: web::Path<PathNetwork>,
-    add_node: web::Json<AddNode>,
+    add_node: web::Json<Node>,
     _identity: Identity,
 ) -> Result<impl Responder> {
     let add_node = add_node.into_inner();
     VpnSupervisor::from_registry()
         .send(VpnAddNode {
             net_id: path.into_inner().net_id,
-            ip: add_node.ip,
+            address: add_node.address,
             id: add_node.id,
         })
         .await??;
@@ -104,7 +105,7 @@ async fn connect_tcp(
     let vpn_rx = vpn
         .send(ConnectTcp {
             receiver: ws_rx,
-            ip: model.ip,
+            address: model.ip,
             port: model.port,
         })
         .await??;

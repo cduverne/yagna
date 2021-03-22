@@ -7388,8 +7388,9 @@ dependencies = [
 [[package]]
 name = "ya-client"
 version = "0.5.2"
-source = "git+https://github.com/golemfactory/ya-client.git?branch=mf/vpn#9fd113df73061e44295103eb776871601493eb4a"
+source = "git+https://github.com/golemfactory/ya-client.git?branch=mf/vpn#813a6eb0ecf6f923741fe0c773ca638b5979fae8"
 dependencies = [
+ "actix-codec 0.2.0",
  "awc 1.0.1",
  "bytes 0.5.6",
  "chrono",
@@ -7413,7 +7414,7 @@ dependencies = [
 [[package]]
 name = "ya-client-model"
 version = "0.3.2"
-source = "git+https://github.com/golemfactory/ya-client.git?branch=mf/vpn#9fd113df73061e44295103eb776871601493eb4a"
+source = "git+https://github.com/golemfactory/ya-client.git?branch=mf/vpn#813a6eb0ecf6f923741fe0c773ca638b5979fae8"
 dependencies = [
  "bigdecimal 0.2.0",
  "chrono",
@@ -8280,6 +8281,7 @@ name = "ya-vpn"
 version = "0.1.0"
 dependencies = [
  "actix",
+ "actix-rt",
  "actix-web 3.3.2",
  "actix-web-actors",
  "anyhow",
@@ -8295,13 +8297,16 @@ dependencies = [
  "serde",
  "serde_json",
  "smoltcp",
+ "structopt",
  "thiserror",
  "tokio 0.2.24",
+ "url 2.2.0",
+ "uuid 0.8.2",
+ "ya-client",
  "ya-client-model",
  "ya-core-model",
  "ya-net",
  "ya-persistence",
- "ya-sb-router",
  "ya-service-api",
  "ya-service-api-interfaces",
  "ya-service-api-web",

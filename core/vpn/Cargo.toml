@@ -35,4 +35,10 @@ thiserror = "1.0"
 tokio = { version = "0.2.11", features = ["time"] }
 
 [dev-dependencies]
-ya-sb-router = "0.4"
+ya-client = "0.5"
+
+actix-rt = "1.0"
+structopt = "0.3"
+url = "2.1"
+uuid = { version = "0.8", features = ["v4"] }
+
